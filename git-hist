@@ -1,0 +1,570 @@
+#!/usr/bin/env python3
+"""git-hist: interactive two-pane git history browser.
+
+Usage:
+    git-hist                 history from `git la` (all refs)
+    git-hist <args...>       history from `git ll <args...>`
+
+Left pane: the graph log, one commit selected (inverted).
+Right pane: `git show` of the selected commit.
+
+Keys:
+    Left / Right    focus history / details pane  (Tab toggles)
+    Up / Down       history: select prev/next commit; details: scroll
+    PgUp / PgDn     page up/down (Space also pages down)
+    Home / End      first / last
+    < / >           shrink / grow the history pane
+    Enter           show the details full-screen (Enter / Esc / q / Left: back)
+    /               search the focused pane (regex, smart case; empty = repeat)
+    n / N           next / previous match
+    y / Y           copy the full / short hash of the selected commit
+    q / Esc         quit
+"""
+
+import base64
+import bisect
+import curses
+import os
+import re
+import subprocess
+import sys
+
+# Used when the la/ll aliases are not defined in git config.
+FALLBACK_ALIASES = {
+    "la": ["log", "--decorate", "--oneline", "--graph", "--all"],
+    "ll": ["log", "--decorate", "--oneline", "--graph"],
+}
+
+CSI_RE = re.compile(r"\x1b\[([0-9;:]*)([@-~])")
+HASH_RE = re.compile(r"^[*|/\\_ .\-<>o]*?\b([0-9a-f]{7,64})\b")
+
+
+def run_git(args):
+    return subprocess.run(["git", *args], capture_output=True, text=True,
+                          errors="replace")
+
+
+def copy_to_clipboard(text):
+    """Copy text to the clipboard; returns a description of how."""
+    candidates = []
+    if os.environ.get("WAYLAND_DISPLAY"):
+        candidates.append(["wl-copy"])
+    if os.environ.get("DISPLAY"):
+        candidates += [["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]
+    candidates.append(["pbcopy"])
+    for cmd in candidates:
+        try:
+            r = subprocess.run(cmd, input=text, text=True, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode == 0:
+            return cmd[0]
+    # OSC 52: ask the terminal itself to set the clipboard (works over ssh).
+    seq = "\x1b]52;c;" + base64.b64encode(text.encode()).decode() + "\a"
+    if os.environ.get("TMUX"):
+        seq = "\x1bPtmux;" + seq.replace("\x1b", "\x1b\x1b") + "\x1b\\"
+    os.write(sys.stdout.fileno(), seq.encode())
+    return "terminal (OSC 52)"
+
+
+def strip_ansi(s):
+    return CSI_RE.sub("", s)
+
+
+def log_command(argv):
+    alias = "ll" if argv else "la"
+    if run_git(["config", "--get", f"alias.{alias}"]).returncode == 0:
+        base = [alias]
+    else:
+        base = FALLBACK_ALIASES[alias]
+    return alias, [*base, "--color=always", *argv]
+
+
+class Ansi:
+    """Converts SGR-colored text into curses (text, attr) segments."""
+
+    def __init__(self):
+        self.colors = curses.COLORS if curses.has_colors() else 0
+        self.pairs = {}
+
+    def _color(self, c):
+        if c < 0 or self.colors == 0:
+            return -1
+        if c < self.colors:
+            return c
+        return c % 8 if c < 16 else -1
+
+    def _pair(self, fg, bg):
+        if (fg, bg) == (-1, -1) or self.colors == 0:
+            return 0
+        key = (fg, bg)
+        if key not in self.pairs:
+            n = len(self.pairs) + 1
+            if n >= curses.COLOR_PAIRS:
+                return 0
+            curses.init_pair(n, fg, bg)
+            self.pairs[key] = curses.color_pair(n)
+        return self.pairs[key]
+
+    @staticmethod
+    def _rgb_to_256(r, g, b):
+        return 16 + 36 * round(r / 255 * 5) + 6 * round(g / 255 * 5) + round(b / 255 * 5)
+
+    def parse(self, line):
+        segs = []
+        fg = bg = -1
+        attr = 0
+        col = 0
+        pos = 0
+
+        def emit(text):
+            nonlocal col
+            if not text:
+                return
+            out = []
+            for ch in text:
+                if ch == "\t":
+                    n = 8 - col % 8
+                    out.append(" " * n)
+                    col += n
+                elif ch >= " ":
+                    out.append(ch)
+                    col += 1
+            segs.append(("".join(out), self._pair(self._color(fg), self._color(bg)) | attr))
+
+        for m in CSI_RE.finditer(line):
+            emit(line[pos:m.start()])
+            pos = m.end()
+            if m.group(2) != "m":
+                continue
+            params = [int(p) if p else 0 for p in re.split("[;:]", m.group(1))]
+            i = 0
+            while i < len(params):
+                p = params[i]
+                if p == 0:
+                    fg = bg = -1
+                    attr = 0
+                elif p == 1:
+                    attr |= curses.A_BOLD
+                elif p == 2:
+                    attr |= curses.A_DIM
+                elif p == 3:
+                    attr |= getattr(curses, "A_ITALIC", 0)
+                elif p == 4:
+                    attr |= curses.A_UNDERLINE
+                elif p == 7:
+                    attr |= curses.A_REVERSE
+                elif p == 22:
+                    attr &= ~(curses.A_BOLD | curses.A_DIM)
+                elif p == 23:
+                    attr &= ~getattr(curses, "A_ITALIC", 0)
+                elif p == 24:
+                    attr &= ~curses.A_UNDERLINE
+                elif p == 27:
+                    attr &= ~curses.A_REVERSE
+                elif 30 <= p <= 37:
+                    fg = p - 30
+                elif p == 39:
+                    fg = -1
+                elif 40 <= p <= 47:
+                    bg = p - 40
+                elif p == 49:
+                    bg = -1
+                elif 90 <= p <= 97:
+                    fg = p - 90 + 8 if self.colors >= 16 else p - 90
+                elif 100 <= p <= 107:
+                    bg = p - 100 + 8 if self.colors >= 16 else p - 100
+                elif p in (38, 48) and i + 1 < len(params):
+                    if params[i + 1] == 5 and i + 2 < len(params):
+                        c = params[i + 2]
+                        i += 2
+                    elif params[i + 1] == 2 and i + 4 < len(params):
+                        c = self._rgb_to_256(*params[i + 2:i + 5])
+                        i += 4
+                    else:
+                        c = -1
+                        i += 1
+                    if p == 38:
+                        fg = c
+                    else:
+                        bg = c
+                i += 1
+        emit(line[pos:])
+        return segs
+
+
+def draw_segs(win, y, x, width, segs, extra=0, fill=False):
+    col = 0
+    for text, attr in segs:
+        if col >= width:
+            break
+        t = text[:width - col]
+        try:
+            win.addstr(y, x + col, t, attr | extra)
+        except curses.error:
+            pass
+        col += len(t)
+    if fill and col < width:
+        try:
+            win.addstr(y, x + col, " " * (width - col), extra)
+        except curses.error:
+            pass
+
+
+def seg_text(segs):
+    return "".join(t for t, _ in segs)
+
+
+def highlight(segs, pattern, match_attr):
+    """Split segments so that regex matches get match_attr applied."""
+    if pattern is None:
+        return segs
+    spans = [m.span() for m in pattern.finditer(seg_text(segs)) if m.end() > m.start()]
+    if not spans:
+        return segs
+    out = []
+    pos = 0
+    for text, attr in segs:
+        end = pos + len(text)
+        cuts = sorted({pos, end, *(c for s, e in spans for c in (s, e) if pos < c < end)})
+        for c0, c1 in zip(cuts, cuts[1:]):
+            hit = any(s <= c0 and c1 <= e for s, e in spans)
+            out.append((text[c0 - pos:c1 - pos], match_attr(attr) if hit else attr))
+        pos = end
+    return out
+
+
+def compile_pattern(s):
+    flags = 0 if any(c.isupper() for c in s) else re.IGNORECASE
+    try:
+        return re.compile(s, flags)
+    except re.error:
+        return re.compile(re.escape(s), flags)
+
+
+class App:
+    def __init__(self, stdscr, log_lines, title):
+        self.scr = stdscr
+        self.ansi = Ansi()
+        self.title = title
+        self.log_raw = log_lines
+        self.log_parsed = {}
+        self.hashes = [None] * len(log_lines)
+        self.commit_lines = []
+        for i, line in enumerate(log_lines):
+            m = HASH_RE.match(strip_ansi(line))
+            if m:
+                self.hashes[i] = m.group(1)
+                self.commit_lines.append(i)
+        self.sel_pos = 0          # index into commit_lines
+        self.ltop = 0
+        self.rtop = 0
+        self.focus = "L"
+        self.full = False         # details pane full-screen
+        self.ratio = 0.5
+        self.show_cache = {}
+        self.pattern = None
+        self.rmatch = None        # line of the last match in the details pane
+        self.message = ""
+
+    # --- data -------------------------------------------------------------
+
+    @property
+    def sel(self):
+        return self.commit_lines[self.sel_pos]
+
+    def log_line(self, i):
+        if i not in self.log_parsed:
+            self.log_parsed[i] = self.ansi.parse(self.log_raw[i])
+        return self.log_parsed[i]
+
+    def show_lines(self):
+        h = self.hashes[self.sel]
+        if h not in self.show_cache:
+            r = run_git(["show", "--color=always", h])
+            text = r.stdout if r.returncode == 0 else r.stderr
+            self.show_cache[h] = [self.ansi.parse(l) for l in text.splitlines()]
+        return self.show_cache[h]
+
+    def match_attr(self, attr):
+        if self.ansi.colors:
+            return (attr & ~curses.A_COLOR) | self.ansi._pair(0, 3) | curses.A_BOLD
+        return attr ^ curses.A_REVERSE
+
+    # --- geometry ---------------------------------------------------------
+
+    def geometry(self):
+        h, w = self.scr.getmaxyx()
+        lw = max(10, min(w - 11, int(w * self.ratio)))
+        return h, w, lw, max(1, h - 2)
+
+    @property
+    def details_active(self):
+        return self.full or self.focus == "R"
+
+    # --- movement ---------------------------------------------------------
+
+    def select(self, pos):
+        pos = max(0, min(len(self.commit_lines) - 1, pos))
+        if pos != self.sel_pos:
+            self.sel_pos = pos
+            self.rtop = 0
+            self.rmatch = None
+        _, _, _, ph = self.geometry()
+        if self.sel < self.ltop:
+            self.ltop = self.sel
+        elif self.sel >= self.ltop + ph:
+            self.ltop = self.sel - ph + 1
+        if self.sel_pos == 0:
+            self.ltop = 0
+
+    def select_line(self, line):
+        pos = bisect.bisect_left(self.commit_lines, line)
+        self.select(pos)
+
+    def scroll_right(self, delta):
+        _, _, _, ph = self.geometry()
+        maxtop = max(0, len(self.show_lines()) - ph)
+        self.rtop = max(0, min(maxtop, self.rtop + delta))
+
+    # --- search -----------------------------------------------------------
+
+    def prompt(self, prefix):
+        """Read a line of input in the status row; None if cancelled."""
+        buf = ""
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
+        try:
+            while True:
+                h, w = self.scr.getmaxyx()
+                draw_segs(self.scr, h - 1, 0, w - 1, [(prefix + buf, 0)], fill=True)
+                self.scr.move(h - 1, min(w - 2, len(prefix) + len(buf)))
+                self.scr.refresh()
+                ch = self.scr.get_wch()
+                if ch in ("\n", "\r", curses.KEY_ENTER):
+                    return buf
+                if ch == "\x1b":
+                    return None
+                if ch in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                    if not buf:
+                        return None
+                    buf = buf[:-1]
+                elif ch == curses.KEY_RESIZE:
+                    self.draw()
+                elif isinstance(ch, str) and ch.isprintable():
+                    buf += ch
+        finally:
+            curses.curs_set(0)
+
+    def find(self, count, text_of, start, step):
+        """Index of the next matching line from start (wrapping), or None."""
+        for k in range(count):
+            i = start + step * k
+            if self.pattern.search(text_of(i % count)):
+                if not 0 <= i < count:
+                    self.message = "search wrapped"
+                return i % count
+        self.message = f"pattern not found: {self.pattern.pattern}"
+        return None
+
+    def search(self, step):
+        if self.pattern is None:
+            self.message = "no previous search"
+            return
+        if self.details_active:
+            show = self.show_lines()
+            if not show:
+                return
+            _, _, _, ph = self.geometry()
+            if self.rmatch is not None and self.rtop <= self.rmatch < self.rtop + ph:
+                start = self.rmatch + step
+            else:
+                start = self.rtop if step > 0 else self.rtop - 1
+            i = self.find(len(show), lambda i: seg_text(show[i]), start, step)
+            if i is not None:
+                self.rmatch = i
+                self.rtop = i
+                self.scroll_right(0)
+        else:
+            n = len(self.log_raw)
+            i = self.find(n, lambda i: seg_text(self.log_line(i)) if self.hashes[i] else "",
+                          self.sel + step, step)
+            if i is not None:
+                self.select_line(i)
+
+    # --- keys -------------------------------------------------------------
+
+    def handle(self, key):
+        _, _, _, ph = self.geometry()
+        self.message = ""
+        if self.full and key in (10, 13, curses.KEY_ENTER, 27, ord("q"), curses.KEY_LEFT):
+            self.full = False
+            return True
+        if key in (ord("q"), 27):
+            return False
+        if key in (10, 13, curses.KEY_ENTER):
+            self.full = True
+        elif key == ord("/"):
+            s = self.prompt("/")
+            if s:
+                self.pattern = compile_pattern(s)
+                self.rmatch = None
+            if s is not None:
+                self.search(1)
+        elif key == ord("n"):
+            self.search(1)
+        elif key == ord("N"):
+            self.search(-1)
+        elif key in (ord("y"), ord("Y")):
+            h = self.hashes[self.sel]
+            if key == ord("y"):
+                h = run_git(["rev-parse", h]).stdout.strip() or h
+            self.message = f"copied {h} via {copy_to_clipboard(h)}"
+        elif key == curses.KEY_LEFT:
+            self.focus = "L"
+        elif key == curses.KEY_RIGHT:
+            self.focus = "R"
+        elif key == 9:
+            self.focus = "R" if self.focus == "L" else "L"
+        elif key == ord("<"):
+            self.ratio = max(0.1, self.ratio - 0.05)
+        elif key == ord(">"):
+            self.ratio = min(0.9, self.ratio + 0.05)
+        elif not self.details_active:
+            if key in (curses.KEY_UP, ord("k")):
+                self.select(self.sel_pos - 1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                self.select(self.sel_pos + 1)
+            elif key == curses.KEY_PPAGE:
+                self.select_line(self.sel - ph)
+            elif key in (curses.KEY_NPAGE, ord(" ")):
+                self.select_line(self.sel + ph)
+            elif key == curses.KEY_HOME:
+                self.select(0)
+            elif key == curses.KEY_END:
+                self.select(len(self.commit_lines) - 1)
+        else:
+            if key in (curses.KEY_UP, ord("k")):
+                self.scroll_right(-1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                self.scroll_right(1)
+            elif key == curses.KEY_PPAGE:
+                self.scroll_right(-ph)
+            elif key in (curses.KEY_NPAGE, ord(" ")):
+                self.scroll_right(ph)
+            elif key == curses.KEY_HOME:
+                self.rtop = 0
+            elif key == curses.KEY_END:
+                self.scroll_right(10 ** 9)
+        return True
+
+    # --- drawing ----------------------------------------------------------
+
+    def draw(self):
+        h, w, lw, ph = self.geometry()
+        if self.full:
+            rx, rw = 0, w
+        else:
+            rx, rw = lw + 1, w - lw - 1
+        self.scr.erase()
+        if h < 3 or w < 21:
+            self.scr.refresh()
+            return
+        # keep the selection visible after a resize
+        if self.sel >= self.ltop + ph:
+            self.ltop = self.sel - ph + 1
+
+        focused = curses.A_REVERSE | curses.A_BOLD
+        unfocused = curses.A_UNDERLINE
+        rhead = f" git show {self.hashes[self.sel]}"
+        if self.full:
+            rhead += "   (full screen)"
+        else:
+            draw_segs(self.scr, 0, 0, lw, [(f" {self.title}", 0)],
+                      focused if self.focus == "L" else unfocused, fill=True)
+            self.scr.vline(0, lw, curses.ACS_VLINE, h - 1)
+            for row in range(ph):
+                i = self.ltop + row
+                if i >= len(self.log_raw):
+                    break
+                is_sel = i == self.sel
+                segs = highlight(self.log_line(i), self.pattern, self.match_attr)
+                draw_segs(self.scr, row + 1, 0, lw, segs,
+                          curses.A_REVERSE if is_sel else 0, fill=is_sel)
+        draw_segs(self.scr, 0, rx, rw, [(rhead, 0)],
+                  focused if self.details_active else unfocused, fill=True)
+
+        show = self.show_lines()
+        self.rtop = max(0, min(self.rtop, max(0, len(show) - ph)))
+        for row in range(ph):
+            i = self.rtop + row
+            if i >= len(show):
+                break
+            draw_segs(self.scr, row + 1, rx, rw,
+                      highlight(show[i], self.pattern, self.match_attr))
+
+        pct = 100 if len(show) <= ph else (self.rtop + ph) * 100 // len(show)
+        status = (f" commit {self.sel_pos + 1}/{len(self.commit_lines)}"
+                  f"  diff {min(pct, 100)}%   ")
+        if self.message:
+            status += self.message
+        elif self.full:
+            status += "↑/↓ scroll  PgUp/PgDn  Home/End  / search  n/N next/prev  y/Y copy hash  Enter/q back"
+        else:
+            status += ("←/→ focus  ↑/↓ move  Enter full  / search  n/N next/prev  y/Y copy hash"
+                       "  </> resize  q quit")
+        draw_segs(self.scr, h - 1, 0, w - 1, [(status, 0)], curses.A_REVERSE, fill=True)
+        self.scr.refresh()
+
+    def run(self):
+        curses.curs_set(0)
+        self.scr.keypad(True)
+        while True:
+            self.draw()
+            key = self.scr.getch()
+            # Handle queued keys (e.g. held arrow key) before the next redraw,
+            # so we don't run `git show` for every intermediate commit.
+            while key != -1:
+                if not self.handle(key):
+                    return
+                self.scr.nodelay(True)
+                key = self.scr.getch()
+                self.scr.nodelay(False)
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    alias, cmd = log_command(argv)
+    r = run_git(cmd)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr)
+        return r.returncode
+    lines = r.stdout.splitlines()
+    if not any(HASH_RE.match(strip_ansi(l)) for l in lines):
+        print("git-hist: no commits to show", file=sys.stderr)
+        return 1
+
+    title = " ".join(["git", alias, *argv])
+    os.environ.setdefault("ESCDELAY", "25")
+
+    def wrapped(stdscr):
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+        App(stdscr, lines, title).run()
+
+    try:
+        curses.wrapper(wrapped)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
