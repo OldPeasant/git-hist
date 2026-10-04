@@ -51,7 +51,7 @@ def copy_to_clipboard(text):
         candidates.append(["wl-copy"])
     if os.environ.get("DISPLAY"):
         candidates += [["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]
-    candidates.append(["pbcopy"])
+    candidates += [["pbcopy"], ["clip.exe"]]   # macOS; Windows and WSL
     for cmd in candidates:
         try:
             r = subprocess.run(cmd, input=text, text=True, stdout=subprocess.DEVNULL,

@@ -156,8 +156,7 @@ Requires [Git for Windows](https://gitforwindows.org/).
    not from the subfolder you're in.
 
 Use [Windows Terminal](https://aka.ms/terminal) for proper colors and keys.
-Copying a hash uses the terminal clipboard escape sequence (OSC 52). Windows
-Terminal supports it; the old console window does not.
+Copying a hash uses `clip.exe`, which comes with Windows.
 
 ## Clipboard
 
@@ -165,7 +164,8 @@ Terminal supports it; the old console window does not.
 
 1. `wl-copy` (if `WAYLAND_DISPLAY` is set)
 2. `xclip` / `xsel` (if `DISPLAY` is set)
-3. `pbcopy`
+3. `pbcopy` (macOS)
+4. `clip.exe` (Windows, and Linux under WSL)
 
 If none of these works, the script falls back to OSC 52, an escape sequence that
 asks the terminal to set the clipboard. This also works over SSH in most modern
